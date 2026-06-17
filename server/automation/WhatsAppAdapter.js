@@ -354,11 +354,14 @@ class WhatsAppAdapter {
 
         await this.page.waitForTimeout(3000);
 
-        // --- STEP 2: Click "My status", then "Photos & videos", then upload file ---
-    // Flow: Click "My status" -> menu appears with "Photos & videos" / "Text" -> click "Photos & videos" -> file chooser opens
+        // --- STEP 2: Click "My status", then upload file via hidden input ---
+    // WhatsApp Web has a hidden input[type="file"] in the DOM.
+    // After clicking "My status", a menu appears with "Photos & videos" / "Text".
+    // Instead of clicking "Photos & videos" and waiting for fileChooser (unreliable),
+    // we directly find the hidden file input and set files on it.
     let fileUploaded = false;
 
-    // First, click "My status" / "Click to add status update"
+    // Click "My status" to activate the status upload area
     try {
         const addStatusLink = this.page.getByText('Click to add status update');
         if (await addStatusLink.isVisible({ timeout: 3000 })) {
@@ -372,7 +375,7 @@ class WhatsAppAdapter {
             }
         }
     } catch (e) {
-        logger.info('Could not click My status text, trying + button');
+        // Try + button
         try {
             const plusBtn = this.page.locator('[aria-label*="Add"], [aria-label*="add"]').first();
             if (await plusBtn.isVisible({ timeout: 2000 })) {
@@ -383,78 +386,59 @@ class WhatsAppAdapter {
         }
     }
 
-    // Wait for the menu with "Photos & videos" and "Text" to appear
     await this.page.waitForTimeout(2000);
 
-    // Click "Photos & videos" - the FIRST option in the dropdown menu
-    // The dropdown has 2 items: "Photos & videos" (first) and "Text" (second)
+    // Now find the hidden input[type="file"] and set files directly
+    // WhatsApp Web puts a hidden file input in the DOM when the menu appears
+    // We can set files on it without needing to click "Photos & videos"
     try {
-        const [fileChooser] = await Promise.all([
-            this.page.waitForEvent('filechooser', { timeout: 15000 }),
-            (async () => {
-                // Strategy: The dropdown is a small popup menu. "Photos & videos" is the first clickable item.
-                // We'll use multiple approaches to find and click it.
-                
-                // Approach 1: Find all visible popup/menu items and click the first one
-                // (Photos & videos is always the first option)
-                const clicked = await this.page.evaluate(() => {
-                    // Look for elements containing "Photo" text (partial match)
-                    const allEls = document.querySelectorAll('*');
-                    for (const el of allEls) {
-                        // Only check leaf nodes or elements with short direct text
-                        if (el.children.length === 0 || el.childElementCount <= 2) {
-                            const text = el.innerText || el.textContent || '';
-                            if (text.includes('Photo') && !text.includes('Recent') && text.length < 50) {
-                                el.click();
-                                return 'clicked-photo-text: ' + text.substring(0, 30);
-                            }
-                        }
-                    }
-                    return null;
-                });
-                
-                if (clicked) {
-                    logger.info('Photos & videos clicked via evaluate: ' + clicked);
-                    return;
-                }
-
-                // Approach 2: Use Playwright locator with has-text
-                try {
-                    const menuItem = this.page.locator('div, span, li, button').filter({ hasText: /Photo/ }).first();
-                    if (await menuItem.isVisible({ timeout: 2000 })) {
-                        await menuItem.click();
-                        logger.info('Clicked via Playwright filter hasText Photo');
-                        return;
-                    }
-                } catch (e) { /* continue */ }
-
-                // Approach 3: Click input[type=file] if it appeared
-                const fileInput = await this.page.$('input[type="file"]');
-                if (fileInput) {
-                    await fileInput.click();
-                    logger.info('Clicked input[type=file] directly');
-                }
-            })()
-        ]);
-
-        if (fileChooser) {
-            await fileChooser.setFiles(mediaPath);
-            fileUploaded = true;
-            logger.info('File uploaded successfully via fileChooser');
+        // Look for input[type="file"] with accept attribute for images/videos
+        let fileInput = await this.page.$('input[type="file"][accept*="image"]');
+        if (!fileInput) {
+            fileInput = await this.page.$('input[type="file"][accept*="video"]');
         }
-    } catch (e) {
-        logger.info('FileChooser approach failed: ' + e.message);
-        // Last resort: try input[type=file] directly
-        const fileInput = await this.page.$('input[type="file"]');
+        if (!fileInput) {
+            fileInput = await this.page.$('input[type="file"]');
+        }
+
         if (fileInput) {
             await fileInput.setInputFiles(mediaPath);
             fileUploaded = true;
-            logger.info('File uploaded via input[type=file] fallback');
+            logger.info('File uploaded directly via hidden input[type=file]');
+        } else {
+            // If no input found yet, click "Photos & videos" text to make it appear
+            logger.info('No file input found, clicking Photos & videos option...');
+            
+            await this.page.evaluate(() => {
+                const allEls = document.querySelectorAll('*');
+                for (const el of allEls) {
+                    if (el.children.length <= 3) {
+                        const text = (el.innerText || '').trim();
+                        if (text.includes('Photo') && text.length < 50) {
+                            el.click();
+                            return true;
+                        }
+                    }
+                }
+                return false;
+            });
+
+            await this.page.waitForTimeout(1500);
+
+            // Try finding file input again after clicking
+            fileInput = await this.page.$('input[type="file"]');
+            if (fileInput) {
+                await fileInput.setInputFiles(mediaPath);
+                fileUploaded = true;
+                logger.info('File uploaded via input after clicking Photos option');
+            }
         }
+    } catch (e) {
+        logger.error('File upload error: ' + e.message);
     }
 
     if (!fileUploaded) {
-        return { success: false, error: 'Could not upload file - Photos & videos option not found' };
+        return { success: false, error: 'Could not upload file - no file input found in DOM' };
     }
 
     // --- STEP 3: Wait for media to load, enter caption ---
