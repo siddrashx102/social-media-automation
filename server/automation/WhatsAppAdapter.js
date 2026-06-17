@@ -354,90 +354,87 @@ class WhatsAppAdapter {
 
         await this.page.waitForTimeout(3000);
 
-        // --- STEP 2: Click "My status", then "Photos & videos", then handle file upload ---
-        let fileUploaded = false;
+        // --- STEP 2: Click "My status", then "Photos & videos", then upload file ---
+    // Flow: Click "My status" -> menu appears with "Photos & videos" / "Text" -> click "Photos & videos" -> file chooser opens
+    let fileUploaded = false;
 
-        // First, click "My status" or "Click to add status update"
-        try {
-            const addStatusLink = this.page.getByText('Click to add status update');
-            if (await addStatusLink.isVisible({ timeout: 3000 })) {
-                await addStatusLink.click();
-                logger.info('Clicked "Click to add status update"');
-            } else {
-                const myStatus = this.page.getByText('My status', { exact: true });
-                if (await myStatus.isVisible({ timeout: 2000 })) {
-                    await myStatus.click();
-                    logger.info('Clicked "My status"');
-                }
-            }
-        } catch (e) {
-            logger.info('Could not click My status text, trying + button');
-            try {
-                const plusBtn = this.page.locator('[aria-label*="Add"], [aria-label*="add"], [data-icon="plus"]').first();
-                if (await plusBtn.isVisible({ timeout: 2000 })) {
-                    await plusBtn.click();
-                    logger.info('Clicked + button');
-                }
-            } catch (e2) {
-                return { success: false, error: 'Could not find My status or add button' };
+    // First, click "My status" / "Click to add status update"
+    try {
+        const addStatusLink = this.page.getByText('Click to add status update');
+        if (await addStatusLink.isVisible({ timeout: 3000 })) {
+            await addStatusLink.click();
+            logger.info('Clicked "Click to add status update"');
+        } else {
+            const myStatus = this.page.getByText('My status', { exact: true });
+            if (await myStatus.isVisible({ timeout: 2000 })) {
+                await myStatus.click();
+                logger.info('Clicked "My status"');
             }
         }
-
-        // Wait for the menu with "Photos & videos" and "Text" options to appear
-        await this.page.waitForTimeout(1500);
-
-        // Click "Photos & videos" option - this will trigger the file chooser
+    } catch (e) {
+        logger.info('Could not click My status text, trying + button');
         try {
-            const [fileChooser] = await Promise.all([
-                this.page.waitForEvent('filechooser', { timeout: 10000 }),
-                (async () => {
-                    // Try multiple ways to find and click "Photos & videos"
-                    const photosOption = this.page.getByText('Photos & videos');
-                    if (await photosOption.isVisible({ timeout: 3000 })) {
-                        await photosOption.click();
-                        logger.info('Clicked "Photos & videos" option');
-                        return;
-                    }
-                    // Fallback: try partial text match
-                    const photoAlt = this.page.locator('text=/photo|Photo|image|Image|video|Video/i').first();
-                    if (await photoAlt.isVisible({ timeout: 2000 })) {
-                        await photoAlt.click();
-                        logger.info('Clicked photo/video option via regex');
-                        return;
-                    }
-                    // Fallback: click first menu item (Photos is usually first)
-                    const menuItems = this.page.locator('[role="button"], [role="menuitem"], li').first();
-                    await menuItems.click();
-                    logger.info('Clicked first menu item as fallback');
-                })()
-            ]);
-
-            await fileChooser.setFiles(mediaPath);
-            fileUploaded = true;
-            logger.info('File uploaded via fileChooser after Photos & videos click');
-        } catch (e) {
-            logger.info('Photos & videos + fileChooser approach failed: ' + e.message);
+            const plusBtn = this.page.locator('[aria-label*="Add"], [aria-label*="add"]').first();
+            if (await plusBtn.isVisible({ timeout: 2000 })) {
+                await plusBtn.click();
+            }
+        } catch (e2) {
+            return { success: false, error: 'Could not find My status or add button' };
         }
+    }
 
-        // Fallback: try finding input[type=file] directly
-        if (!fileUploaded) {
-            try {
+    // Wait for the menu with "Photos & videos" and "Text" to appear
+    await this.page.waitForTimeout(2000);
+
+    // Click "Photos & videos" option - this triggers the file chooser
+    try {
+        const [fileChooser] = await Promise.all([
+            this.page.waitForEvent('filechooser', { timeout: 15000 }),
+            (async () => {
+                // Try "Photos & videos" text
+                const photosOption = this.page.getByText('Photos & videos');
+                if (await photosOption.isVisible({ timeout: 3000 })) {
+                    await photosOption.click();
+                    logger.info('Clicked "Photos & videos" option');
+                    return;
+                }
+                // Fallback: try "Photo" or "Video" partial match
+                const photoBtn = this.page.locator('[aria-label*="Photo"], [aria-label*="photo"], [aria-label*="image"], [aria-label*="Image"]').first();
+                if (await photoBtn.isVisible({ timeout: 2000 })) {
+                    await photoBtn.click();
+                    logger.info('Clicked photo option via aria-label');
+                    return;
+                }
+                // Last resort: click input[type=file] directly
                 const fileInput = await this.page.$('input[type="file"]');
                 if (fileInput) {
-                    await fileInput.setInputFiles(mediaPath);
-                    fileUploaded = true;
-                    logger.info('File uploaded via input[type=file] fallback');
+                    await fileInput.click();
+                    logger.info('Clicked input[type=file] directly');
                 }
-            } catch (e) {
-                logger.info('input[type=file] fallback failed: ' + e.message);
-            }
-        }
+            })()
+        ]);
 
-        if (!fileUploaded) {
-            return { success: false, error: 'Could not find file upload input' };
+        if (fileChooser) {
+            await fileChooser.setFiles(mediaPath);
+            fileUploaded = true;
+            logger.info('File uploaded successfully via fileChooser');
         }
+    } catch (e) {
+        logger.info('FileChooser approach failed: ' + e.message);
+        // Last resort: try input[type=file] directly
+        const fileInput = await this.page.$('input[type="file"]');
+        if (fileInput) {
+            await fileInput.setInputFiles(mediaPath);
+            fileUploaded = true;
+            logger.info('File uploaded via input[type=file] fallback');
+        }
+    }
 
-        // --- STEP 3: Wait for media to load, enter caption ---
+    if (!fileUploaded) {
+        return { success: false, error: 'Could not upload file - Photos & videos option not found' };
+    }
+
+    // --- STEP 3: Wait for media to load, enter caption ---
         await this.page.waitForTimeout(3000);
 
         if (caption) {
