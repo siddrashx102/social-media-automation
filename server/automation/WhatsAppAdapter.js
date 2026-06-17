@@ -1,0 +1,384 @@
+const { chromium } = require('playwright');
+const path = require('path');
+const fs = require('fs');
+const logger = require('../utils/logger');
+const logService = require('../services/LogService');
+const config = require('../config');
+
+/**
+ * Playwright-based automation class for WhatsApp Web interactions.
+ * Uses a persistent browser context to maintain login sessions.
+ */
+class WhatsAppAdapter {
+    constructor() {
+        this.context = null;
+        this.page = null;
+        this._isInitialized = false;
+    }
+
+    /**
+     * Launches Chromium with a persistent browser context.
+     * @param {string} profilePath - Path to the browser profile directory
+     * @param {boolean} [headless=true] - Whether to run in headless mode
+     */
+    async initialize(profilePath, headless = true) {
+        try {
+            // Ensure profile directory exists
+            if (!fs.existsSync(profilePath)) {
+                fs.mkdirSync(profilePath, { recursive: true });
+            }
+
+            this.context = await chromium.launchPersistentContext(profilePath, {
+                headless,
+                args: [
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-gpu'
+                ],
+                viewport: { width: 1280, height: 800 },
+                timeout: config.PLAYWRIGHT_TIMEOUT_MS
+            });
+
+            this.page = this.context.pages()[0] || await this.context.newPage();
+            this._isInitialized = true;
+            logger.info('WhatsApp Adapter initialized', { profilePath, headless });
+        } catch (err) {
+            logger.error('Failed to initialize WhatsApp Adapter', { error: err.message, stack: err.stack });
+            throw err;
+        }
+    }
+
+    /**
+     * Publishes a status to WhatsApp Web.
+     * Opens WhatsApp Web, verifies login, navigates to Status, uploads media, and publishes.
+     * @param {string} mediaPath - Absolute path to the media file
+     * @param {string|null} [caption] - Optional caption text
+     * @returns {Promise<{success: true} | {success: false, error: string}>}
+     */
+    async publish(mediaPath, caption = null) {
+        let timeoutHandle;
+
+        try {
+            // Verify media file exists
+            if (!fs.existsSync(mediaPath)) {
+                return { success: false, error: 'Media file not found' };
+            }
+
+            // Create timeout promise (30 seconds)
+            const timeoutPromise = new Promise((_, reject) => {
+                timeoutHandle = setTimeout(() => {
+                    reject(new Error('Operation timed out after 30 seconds'));
+                }, config.PLAYWRIGHT_TIMEOUT_MS);
+            });
+
+            // Execute publish workflow with timeout
+            const publishPromise = this._executePublishWorkflow(mediaPath, caption);
+            const result = await Promise.race([publishPromise, timeoutPromise]);
+
+            clearTimeout(timeoutHandle);
+            return result;
+        } catch (err) {
+            clearTimeout(timeoutHandle);
+            logger.error('Publish failed', { error: err.message, stack: err.stack });
+
+            // Close browser context gracefully on error
+            await this._closeGracefully();
+
+            return { success: false, error: err.message };
+        }
+    }
+
+    /**
+     * Verifies the current WhatsApp Web login status.
+     * @returns {Promise<"active" | "qr_scan_required" | "unknown">}
+     */
+    async verifyLogin() {
+        try {
+            await this._ensureInitialized();
+            await this.page.goto(config.DEFAULT_WHATSAPP_WEB_URL, {
+                waitUntil: 'domcontentloaded',
+                timeout: config.PLAYWRIGHT_TIMEOUT_MS
+            });
+
+            // Wait for either the chat interface or QR code
+            const result = await Promise.race([
+                this.page.waitForSelector('[data-testid="chat-list"]', { timeout: 15000 })
+                    .then(() => 'active'),
+                this.page.waitForSelector('canvas[aria-label="Scan this QR code to link a device!"]', { timeout: 15000 })
+                    .then(() => 'qr_scan_required'),
+                this.page.waitForSelector('[data-ref]', { timeout: 15000 })
+                    .then(() => 'qr_scan_required')
+            ]);
+
+            if (result === 'qr_scan_required') {
+                logService.create({
+                    eventType: 'LOGIN_REQUIRED',
+                    message: 'WhatsApp Web requires QR code scan'
+                });
+            }
+
+            logger.info('Login verification result', { status: result });
+            return result;
+        } catch (err) {
+            logger.error('Login verification failed', { error: err.message });
+            return 'unknown';
+        }
+    }
+
+    /**
+     * Opens a visible browser window for QR code scanning.
+     * The operator can scan the QR code manually.
+     */
+    async launchForQrScan() {
+        try {
+            const settingsService = require('../services/SettingsService');
+            const settings = settingsService.get();
+
+            // Close existing context if any
+            await this.close();
+
+            // Launch non-headless browser
+            await this.initialize(settings.playwrightProfilePath, false);
+
+            await this.page.goto(settings.whatsAppWebUrl || config.DEFAULT_WHATSAPP_WEB_URL, {
+                waitUntil: 'domcontentloaded',
+                timeout: config.PLAYWRIGHT_TIMEOUT_MS
+            });
+
+            logger.info('Browser launched for QR scan');
+
+            // Wait for login to complete (up to 2 minutes for QR scan)
+            try {
+                await this.page.waitForSelector('[data-testid="chat-list"]', { timeout: 120000 });
+
+                logService.create({
+                    eventType: 'AUTOMATION_STARTED',
+                    message: 'QR code scanned successfully, WhatsApp Web logged in'
+                });
+
+                logger.info('QR scan completed, login active');
+                return { success: true, status: 'active' };
+            } catch {
+                logger.warn('QR scan timeout - user did not complete scan within 2 minutes');
+                return { success: false, status: 'qr_scan_required' };
+            }
+        } catch (err) {
+            logger.error('Launch for QR scan failed', { error: err.message, stack: err.stack });
+            throw err;
+        }
+    }
+
+    /**
+     * Reinitializes the browser session by deleting profile and creating fresh context.
+     * @param {string} profilePath - Path to the browser profile directory
+     */
+    async reinitializeSession(profilePath) {
+        try {
+            // Close existing context
+            await this.close();
+
+            // Delete profile directory contents
+            if (fs.existsSync(profilePath)) {
+                fs.rmSync(profilePath, { recursive: true, force: true });
+                logger.info('Playwright profile directory cleared', { profilePath });
+            }
+
+            // Create fresh directory
+            fs.mkdirSync(profilePath, { recursive: true });
+
+            logger.info('Session reinitialized', { profilePath });
+            return { success: true };
+        } catch (err) {
+            logger.error('Session reinitialization failed', { error: err.message, stack: err.stack });
+
+            logService.create({
+                eventType: 'AUTOMATION_STOPPED',
+                message: `Session reinitialization failed: ${err.message}`.substring(0, 500)
+            });
+
+            return { success: false, error: err.message };
+        }
+    }
+
+    /**
+     * Gracefully closes the browser context.
+     */
+    async close() {
+        try {
+            if (this.context) {
+                // Set a 10-second timeout for graceful close
+                const closePromise = this.context.close();
+                const timeoutPromise = new Promise((_, reject) => {
+                    setTimeout(() => reject(new Error('Close timed out')), 10000);
+                });
+
+                await Promise.race([closePromise, timeoutPromise]);
+            }
+        } catch (err) {
+            logger.warn('Browser context close error', { error: err.message });
+        } finally {
+            this.context = null;
+            this.page = null;
+            this._isInitialized = false;
+        }
+    }
+
+    // --- Private methods ---
+
+    /**
+     * Ensures the adapter is initialized before operations.
+     */
+    async _ensureInitialized() {
+        if (!this._isInitialized) {
+            const settingsService = require('../services/SettingsService');
+            const settings = settingsService.get();
+            await this.initialize(settings.playwrightProfilePath, settings.headlessMode);
+        }
+    }
+
+    /**
+     * Executes the full publish workflow on WhatsApp Web.
+     * @param {string} mediaPath - Absolute path to media file
+     * @param {string|null} caption - Optional caption
+     * @returns {Promise<{success: true} | {success: false, error: string}>}
+     */
+    async _executePublishWorkflow(mediaPath, caption) {
+        await this._ensureInitialized();
+
+        const settingsService = require('../services/SettingsService');
+        const settings = settingsService.get();
+        const whatsappUrl = settings.whatsAppWebUrl || config.DEFAULT_WHATSAPP_WEB_URL;
+
+        // Navigate to WhatsApp Web
+        await this.page.goto(whatsappUrl, {
+            waitUntil: 'domcontentloaded',
+            timeout: config.PLAYWRIGHT_TIMEOUT_MS
+        });
+
+        // Check login status
+        const loginCheck = await Promise.race([
+            this.page.waitForSelector('[data-testid="chat-list"]', { timeout: 15000 })
+                .then(() => 'active'),
+            this.page.waitForSelector('canvas[aria-label="Scan this QR code to link a device!"]', { timeout: 15000 })
+                .then(() => 'qr_scan_required'),
+            this.page.waitForSelector('[data-ref]', { timeout: 15000 })
+                .then(() => 'qr_scan_required')
+        ]);
+
+        if (loginCheck === 'qr_scan_required') {
+            logService.create({
+                eventType: 'LOGIN_REQUIRED',
+                message: 'Cannot publish: WhatsApp Web requires QR code scan'
+            });
+            return { success: false, error: 'WhatsApp Web requires QR code scan' };
+        }
+
+        // Navigate to Status tab
+        const statusTab = await this.page.waitForSelector('[data-testid="status-v3-tab"]', { timeout: 10000 })
+            .catch(() => null);
+
+        if (!statusTab) {
+            // Try alternative selector for status tab
+            const altStatusTab = await this.page.waitForSelector('span[data-testid="MenuItem"][title="Status"]', { timeout: 5000 })
+                .catch(() => null);
+
+            if (altStatusTab) {
+                await altStatusTab.click();
+            } else {
+                return { success: false, error: 'Could not find Status tab' };
+            }
+        } else {
+            await statusTab.click();
+        }
+
+        // Wait for status interface to load
+        await this.page.waitForTimeout(1000);
+
+        // Click on "My Status" or the add status button
+        const addStatusBtn = await this.page.waitForSelector('[data-testid="status-v3-pencil-btn"], [data-testid="status-v3-camera-btn"], [aria-label="Add status"]', { timeout: 5000 })
+            .catch(() => null);
+
+        if (addStatusBtn) {
+            await addStatusBtn.click();
+        }
+
+        // Upload media file
+        const fileInput = await this.page.waitForSelector('input[type="file"]', { timeout: 5000 })
+            .catch(() => null);
+
+        if (!fileInput) {
+            return { success: false, error: 'Could not find file upload input' };
+        }
+
+        await fileInput.setInputFiles(mediaPath);
+
+        // Wait for media to load
+        await this.page.waitForTimeout(2000);
+
+        // Enter caption if provided
+        if (caption) {
+            const captionInput = await this.page.waitForSelector('[data-testid="media-caption-input-container"] [contenteditable="true"], [data-testid="caption-input-container"] [contenteditable="true"]', { timeout: 5000 })
+                .catch(() => null);
+
+            if (captionInput) {
+                await captionInput.click();
+                await captionInput.fill(caption);
+            }
+        }
+
+        // Click send/publish button
+        const sendBtn = await this.page.waitForSelector('[data-testid="send"], [data-testid="media-upload-btn"], [aria-label="Send"]', { timeout: 5000 })
+            .catch(() => null);
+
+        if (!sendBtn) {
+            return { success: false, error: 'Could not find send button' };
+        }
+
+        await sendBtn.click();
+
+        // Wait for status to be published
+        await this.page.waitForTimeout(3000);
+
+        // Verify status was published by checking the status section
+        const verifyResult = await this._verifyStatusPublished();
+        if (!verifyResult) {
+            return { success: false, error: 'Could not verify status was published' };
+        }
+
+        return { success: true };
+    }
+
+    /**
+     * Verifies that the status was published successfully.
+     * @returns {Promise<boolean>}
+     */
+    async _verifyStatusPublished() {
+        try {
+            // Check for "My status" indicator showing recent upload
+            const myStatus = await this.page.waitForSelector('[data-testid="status-v3-myStatus"], [data-testid="my-status"]', { timeout: 5000 })
+                .catch(() => null);
+
+            return myStatus !== null;
+        } catch {
+            return false;
+        }
+    }
+
+    /**
+     * Closes browser gracefully within 10 seconds on error.
+     */
+    async _closeGracefully() {
+        try {
+            await this.close();
+        } catch (err) {
+            logger.warn('Graceful close failed during error handling', { error: err.message });
+            // Force nullify references
+            this.context = null;
+            this.page = null;
+            this._isInitialized = false;
+        }
+    }
+}
+
+module.exports = new WhatsAppAdapter();
