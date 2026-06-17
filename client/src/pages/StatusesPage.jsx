@@ -26,6 +26,18 @@ function StatusesPage() {
         fetchStatuses();
     }, [page]);
 
+    // Auto-poll when any status is in "posting" state
+    useEffect(() => {
+        const hasPostingStatus = statuses.some(s => s.state === 'posting');
+        if (!hasPostingStatus) return;
+
+        const interval = setInterval(() => {
+            fetchStatuses();
+        }, 3000); // Poll every 3 seconds
+
+        return () => clearInterval(interval);
+    }, [statuses]);
+
     async function fetchStatuses() {
         try {
             setLoading(true);

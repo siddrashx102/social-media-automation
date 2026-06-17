@@ -13,6 +13,7 @@ function seedDefaults(db) {
         const defaults = [
             ['automationEnabled', 'false'],
             ['headlessMode', 'true'],
+            ['slowMoMs', '500'],
             ['whatsAppWebUrl', config.DEFAULT_WHATSAPP_WEB_URL],
             ['playwrightProfilePath', config.DEFAULT_PLAYWRIGHT_PROFILE_PATH]
         ];

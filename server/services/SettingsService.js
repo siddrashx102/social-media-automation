@@ -105,6 +105,10 @@ class SettingsService {
         if (booleanKeys.includes(key)) {
             return value === 'true';
         }
+        const numberKeys = ['slowMoMs'];
+        if (numberKeys.includes(key)) {
+            return parseInt(value, 10) || 0;
+        }
         return value;
     }
 

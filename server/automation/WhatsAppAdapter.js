@@ -20,8 +20,9 @@ class WhatsAppAdapter {
      * Launches Chromium with a persistent browser context.
      * @param {string} profilePath - Path to the browser profile directory
      * @param {boolean} [headless=true] - Whether to run in headless mode
+     * @param {number} [slowMo=0] - Milliseconds to slow down each action (0 = no delay)
      */
-    async initialize(profilePath, headless = true) {
+    async initialize(profilePath, headless = true, slowMo = 0) {
         try {
             // Ensure profile directory exists
             if (!fs.existsSync(profilePath)) {
@@ -30,6 +31,7 @@ class WhatsAppAdapter {
 
             this.context = await chromium.launchPersistentContext(profilePath, {
                 headless,
+                slowMo,
                 args: [
                     '--no-sandbox',
                     '--disable-setuid-sandbox',
@@ -42,7 +44,7 @@ class WhatsAppAdapter {
 
             this.page = this.context.pages()[0] || await this.context.newPage();
             this._isInitialized = true;
-            logger.info('WhatsApp Adapter initialized', { profilePath, headless });
+            logger.info('WhatsApp Adapter initialized', { profilePath, headless, slowMo });
         } catch (err) {
             logger.error('Failed to initialize WhatsApp Adapter', { error: err.message, stack: err.stack });
             throw err;
@@ -291,7 +293,8 @@ class WhatsAppAdapter {
         if (!this._isInitialized) {
             const settingsService = require('../services/SettingsService');
             const settings = settingsService.get();
-            await this.initialize(settings.playwrightProfilePath, settings.headlessMode);
+            const slowMo = settings.slowMoMs || 0;
+            await this.initialize(settings.playwrightProfilePath, settings.headlessMode, slowMo);
         }
     }
 
@@ -343,68 +346,153 @@ class WhatsAppAdapter {
             return { success: false, error: 'WhatsApp Web requires QR code scan' };
         }
 
-        // Navigate to Status tab
-        const statusTab = await this.page.waitForSelector('[data-testid="status-v3-tab"]', { timeout: 10000 })
-            .catch(() => null);
+        // Navigate to Status/Updates tab
+        // WhatsApp Web uses a vertical left sidebar with icon buttons - Status is the 2nd icon
+        const statusTabFound = await this.page.evaluate(() => {
+            // Look for element with tooltip/title "Status"
+            const allElements = document.querySelectorAll('[title="Status"], [aria-label="Status"], [data-testid="status-v3-tab"]');
+            for (const el of allElements) {
+                el.click();
+                return true;
+            }
+            // Try the second navigation button in the left sidebar
+            const navItems = document.querySelectorAll('nav button, nav [role="button"], [role="navigation"] button');
+            if (navItems.length >= 2) {
+                navItems[1].click();
+                return true;
+            }
+            // Try looking for the circular status icon by its parent structure
+            const sidebarBtns = document.querySelectorAll('div[class] > div > button, header ~ div button');
+            for (const btn of sidebarBtns) {
+                const title = btn.getAttribute('title') || btn.getAttribute('aria-label') || '';
+                if (title.toLowerCase().includes('status') || title.toLowerCase().includes('update')) {
+                    btn.click();
+                    return true;
+                }
+            }
+            return false;
+        });
 
-        if (!statusTab) {
-            // Try alternative selector for status tab
-            const altStatusTab = await this.page.waitForSelector('span[data-testid="MenuItem"][title="Status"]', { timeout: 5000 })
-                .catch(() => null);
-
-            if (altStatusTab) {
-                await altStatusTab.click();
+        if (!statusTabFound) {
+            // Fallback: try clicking by aria-label partial match
+            const fallbackTab = await this.page.$('[aria-label*="tatus"]');
+            if (fallbackTab) {
+                await fallbackTab.click();
             } else {
                 return { success: false, error: 'Could not find Status tab' };
             }
-        } else {
-            await statusTab.click();
         }
 
         // Wait for status interface to load
-        await this.page.waitForTimeout(1000);
+        await this.page.waitForTimeout(2000);
 
-        // Click on "My Status" or the add status button
-        const addStatusBtn = await this.page.waitForSelector('[data-testid="status-v3-pencil-btn"], [data-testid="status-v3-camera-btn"], [aria-label="Add status"]', { timeout: 5000 })
-            .catch(() => null);
+        // Click on "My Status" / "Click to add status update" area
+        // On the Status page, there's "My status - Click to add status update" and a "+" button top-right
 
-        if (addStatusBtn) {
-            await addStatusBtn.click();
+        // First, try to set up file chooser listener before clicking
+        const fileChooserPromise = this.page.waitForEvent('filechooser', { timeout: 10000 }).catch(() => null);
+
+        // Click "My status" area or "+" button
+        const addStatusClicked = await this.page.evaluate(() => {
+            // Look for "My status" or "Click to add status update" text
+            const allSpans = document.querySelectorAll('span, div');
+            for (const el of allSpans) {
+                const text = el.textContent || '';
+                if (text.includes('Click to add status update') || text.includes('My status')) {
+                    const clickable = el.closest('[role="button"], [role="listitem"], [tabindex]') || el.closest('div[class]');
+                    if (clickable) { clickable.click(); return 'mystatus'; }
+                    el.click();
+                    return 'mystatus-direct';
+                }
+            }
+            // Try "+" button
+            const plusBtns = document.querySelectorAll('[data-testid="status-v3-add"], [aria-label*="Add"]');
+            for (const btn of plusBtns) { btn.click(); return 'plus'; }
+            // Try any button with "+" icon
+            const iconBtns = document.querySelectorAll('[data-icon="plus"], [data-icon="add"]');
+            for (const btn of iconBtns) { btn.closest('button, [role="button"]')?.click(); return 'icon-plus'; }
+            return null;
+        });
+
+        if (!addStatusClicked) {
+            return { success: false, error: 'Could not find "My status" or add button on Status page' };
         }
 
-        // Upload media file
-        const fileInput = await this.page.waitForSelector('input[type="file"]', { timeout: 5000 })
-            .catch(() => null);
+        logger.info('Add status clicked', { method: addStatusClicked });
+        await this.page.waitForTimeout(2000);
 
-        if (!fileInput) {
-            return { success: false, error: 'Could not find file upload input' };
+        // Handle file upload
+        const fileChooser = await fileChooserPromise;
+
+        if (fileChooser) {
+            // File chooser dialog was triggered
+            await fileChooser.setFiles(mediaPath);
+            logger.info('File uploaded via fileChooser event');
+        } else {
+            // Try finding a hidden input[type="file"] and set files directly
+            const fileInput = await this.page.$('input[type="file"]');
+            if (fileInput) {
+                await fileInput.setInputFiles(mediaPath);
+                logger.info('File uploaded via input.setInputFiles');
+            } else {
+                // Last resort: click on photo/image option if a menu appeared
+                await this.page.evaluate(() => {
+                    const items = document.querySelectorAll('[role="button"], button, li, [role="menuitem"]');
+                    for (const item of items) {
+                        const text = item.textContent || item.getAttribute('aria-label') || '';
+                        if (text.match(/photo|image|gallery|Photos/i)) {
+                            item.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                });
+                await this.page.waitForTimeout(1000);
+
+                const fileInputRetry = await this.page.$('input[type="file"]');
+                if (!fileInputRetry) {
+                    return { success: false, error: 'Could not find file upload input' };
+                }
+                await fileInputRetry.setInputFiles(mediaPath);
+                logger.info('File uploaded via retry input.setInputFiles');
+            }
         }
-
-        await fileInput.setInputFiles(mediaPath);
 
         // Wait for media to load
-        await this.page.waitForTimeout(2000);
+        await this.page.waitForTimeout(3000);
 
         // Enter caption if provided
         if (caption) {
-            const captionInput = await this.page.waitForSelector('[data-testid="media-caption-input-container"] [contenteditable="true"], [data-testid="caption-input-container"] [contenteditable="true"]', { timeout: 5000 })
-                .catch(() => null);
-
+            const captionInput = await this.page.$('[contenteditable="true"]');
             if (captionInput) {
                 await captionInput.click();
-                await captionInput.fill(caption);
+                await this.page.keyboard.type(caption);
+            } else {
+                logger.warn('Caption input not found, proceeding without caption');
             }
         }
 
         // Click send/publish button
-        const sendBtn = await this.page.waitForSelector('[data-testid="send"], [data-testid="media-upload-btn"], [aria-label="Send"]', { timeout: 5000 })
-            .catch(() => null);
+        const sendClicked = await this.page.evaluate(() => {
+            const selectors = [
+                '[data-testid="send"]',
+                '[data-testid="media-upload-btn"]',
+                '[aria-label="Send"]',
+                '[data-testid="status-v3-send"]'
+            ];
+            for (const sel of selectors) {
+                const el = document.querySelector(sel);
+                if (el) { el.click(); return true; }
+            }
+            // Try finding green send button by color/icon
+            const sendBtns = document.querySelectorAll('[data-icon="send"], button[aria-label*="end"]');
+            if (sendBtns.length > 0) { sendBtns[0].click(); return true; }
+            return false;
+        });
 
-        if (!sendBtn) {
+        if (!sendClicked) {
             return { success: false, error: 'Could not find send button' };
         }
-
-        await sendBtn.click();
 
         // Wait for status to be published
         await this.page.waitForTimeout(3000);

@@ -5,6 +5,7 @@ function SettingsForm({ settings, onSaved }) {
     const [formData, setFormData] = useState({
         automationEnabled: settings.automationEnabled || false,
         headlessMode: settings.headlessMode || true,
+        slowMoMs: settings.slowMoMs || 0,
         whatsAppWebUrl: settings.whatsAppWebUrl || '',
         playwrightProfilePath: settings.playwrightProfilePath || ''
     });
@@ -169,6 +170,25 @@ function SettingsForm({ settings, onSaved }) {
                             </label>
                             <div className="form-text">
                                 When enabled, the browser runs in the background without a visible window.
+                            </div>
+                        </div>
+
+                        <div className="mb-3">
+                            <label htmlFor="slowMoMs" className="form-label">
+                                Slow Motion Delay: {formData.slowMoMs}ms
+                            </label>
+                            <input
+                                type="range"
+                                className="form-range"
+                                id="slowMoMs"
+                                min="0"
+                                max="2000"
+                                step="100"
+                                value={formData.slowMoMs}
+                                onChange={(e) => handleChange('slowMoMs', parseInt(e.target.value))}
+                            />
+                            <div className="form-text">
+                                Adds a delay between each browser action so you can watch the automation step by step. Set to 0 for maximum speed.
                             </div>
                         </div>
                     </div>
