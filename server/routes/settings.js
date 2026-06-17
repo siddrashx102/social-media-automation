@@ -57,34 +57,6 @@ router.post('/launch-whatsapp', async (req, res, next) => {
 });
 
 /**
- * POST /api/settings/test-connection
- * Test connection to WhatsApp Web.
- */
-router.post('/test-connection', async (req, res, next) => {
-    try {
-        const settings = settingsService.get();
-
-        await whatsAppAdapter.initialize(settings.playwrightProfilePath, settings.headlessMode);
-        const loginStatus = await whatsAppAdapter.verifyLogin();
-        await whatsAppAdapter.close();
-
-        res.json({
-            success: loginStatus === 'active',
-            loginStatus,
-            message: loginStatus === 'active'
-                ? 'Connection successful, WhatsApp Web is logged in'
-                : 'Connection established but login required (QR scan needed)'
-        });
-    } catch (err) {
-        res.json({
-            success: false,
-            loginStatus: 'unknown',
-            message: `Connection failed: ${err.message}`
-        });
-    }
-});
-
-/**
  * POST /api/settings/reinitialize
  * Reinitialize the browser session (delete profile and create fresh).
  */

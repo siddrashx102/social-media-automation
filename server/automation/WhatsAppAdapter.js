@@ -97,29 +97,72 @@ class WhatsAppAdapter {
         try {
             await this._ensureInitialized();
             await this.page.goto(config.DEFAULT_WHATSAPP_WEB_URL, {
-                waitUntil: 'domcontentloaded',
+                waitUntil: 'load',
                 timeout: config.PLAYWRIGHT_TIMEOUT_MS
             });
 
-            // Wait for either the chat interface or QR code
-            const result = await Promise.race([
-                this.page.waitForSelector('[data-testid="chat-list"]', { timeout: 15000 })
-                    .then(() => 'active'),
-                this.page.waitForSelector('canvas[aria-label="Scan this QR code to link a device!"]', { timeout: 15000 })
-                    .then(() => 'qr_scan_required'),
-                this.page.waitForSelector('[data-ref]', { timeout: 15000 })
-                    .then(() => 'qr_scan_required')
-            ]);
+            // Wait for WhatsApp Web to fully render (it's a heavy SPA)
+            await this.page.waitForTimeout(8000);
 
-            if (result === 'qr_scan_required') {
+            // Strategy: Use page content evaluation for more reliable detection
+            const status = await this.page.evaluate(() => {
+                // Check for canvas element (QR code indicator)
+                const canvases = document.querySelectorAll('canvas');
+                if (canvases.length > 0) {
+                    return 'qr_scan_required';
+                }
+
+                // Check for side pane (chat list - indicates logged in)
+                const sidePane = document.querySelector('#pane-side');
+                if (sidePane) {
+                    return 'active';
+                }
+
+                // Check for any element with role="grid" (chat list uses grid)
+                const grid = document.querySelector('[role="grid"]');
+                if (grid) {
+                    return 'active';
+                }
+
+                // Check for search box (only visible when logged in)
+                const searchBox = document.querySelector('[data-testid="chat-list-search"]') ||
+                    document.querySelector('div[contenteditable="true"][data-tab="3"]') ||
+                    document.querySelector('[title="Search input textbox"]') ||
+                    document.querySelector('div[role="textbox"]');
+                if (searchBox) {
+                    return 'active';
+                }
+
+                // Check for header with profile picture (logged in indicator)
+                const header = document.querySelector('header');
+                if (header && header.querySelectorAll('img').length > 0) {
+                    return 'active';
+                }
+
+                // Check body text for QR-related content
+                const bodyText = document.body.innerText || '';
+                if (bodyText.includes('QR code') || bodyText.includes('Link a device') || bodyText.includes('Phone number')) {
+                    return 'qr_scan_required';
+                }
+
+                // Check if there are multiple divs with chat-like structure
+                const app = document.querySelector('#app');
+                if (app && app.querySelectorAll('[data-testid]').length > 10) {
+                    return 'active';
+                }
+
+                return 'unknown';
+            });
+
+            if (status === 'qr_scan_required') {
                 logService.create({
                     eventType: 'LOGIN_REQUIRED',
                     message: 'WhatsApp Web requires QR code scan'
                 });
             }
 
-            logger.info('Login verification result', { status: result });
-            return result;
+            logger.info('Login verification result', { status });
+            return status;
         } catch (err) {
             logger.error('Login verification failed', { error: err.message });
             return 'unknown';
@@ -178,9 +221,24 @@ class WhatsAppAdapter {
             // Close existing context
             await this.close();
 
-            // Delete profile directory contents
+            // Clear profile directory contents (handle Windows permission issues)
             if (fs.existsSync(profilePath)) {
-                fs.rmSync(profilePath, { recursive: true, force: true });
+                try {
+                    fs.rmSync(profilePath, { recursive: true, force: true });
+                } catch (rmErr) {
+                    // On Windows/OneDrive, rmSync on the directory itself can fail with EPERM
+                    // Try clearing contents individually instead
+                    logger.warn('Could not remove profile directory, clearing contents instead', { error: rmErr.message });
+                    const entries = fs.readdirSync(profilePath);
+                    for (const entry of entries) {
+                        const entryPath = path.join(profilePath, entry);
+                        try {
+                            fs.rmSync(entryPath, { recursive: true, force: true });
+                        } catch {
+                            // Skip files that can't be deleted (locked by OS)
+                        }
+                    }
+                }
                 logger.info('Playwright profile directory cleared', { profilePath });
             }
 
@@ -252,21 +310,32 @@ class WhatsAppAdapter {
 
         // Navigate to WhatsApp Web
         await this.page.goto(whatsappUrl, {
-            waitUntil: 'domcontentloaded',
+            waitUntil: 'networkidle',
             timeout: config.PLAYWRIGHT_TIMEOUT_MS
         });
 
-        // Check login status
-        const loginCheck = await Promise.race([
-            this.page.waitForSelector('[data-testid="chat-list"]', { timeout: 15000 })
-                .then(() => 'active'),
-            this.page.waitForSelector('canvas[aria-label="Scan this QR code to link a device!"]', { timeout: 15000 })
-                .then(() => 'qr_scan_required'),
-            this.page.waitForSelector('[data-ref]', { timeout: 15000 })
-                .then(() => 'qr_scan_required')
-        ]);
+        // Wait for page to settle
+        await this.page.waitForTimeout(5000);
 
-        if (loginCheck === 'qr_scan_required') {
+        // Check login status using resilient selectors
+        const loggedInSelectors = [
+            '[data-testid="chat-list"]',
+            '[data-testid="chatlist"]',
+            '#pane-side',
+            '[data-testid="default-user"]',
+            'div[data-tab="3"]'
+        ];
+
+        let isLoggedIn = false;
+        for (const selector of loggedInSelectors) {
+            const element = await this.page.$(selector);
+            if (element) {
+                isLoggedIn = true;
+                break;
+            }
+        }
+
+        if (!isLoggedIn) {
             logService.create({
                 eventType: 'LOGIN_REQUIRED',
                 message: 'Cannot publish: WhatsApp Web requires QR code scan'
