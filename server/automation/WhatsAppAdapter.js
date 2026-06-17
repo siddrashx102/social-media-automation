@@ -386,30 +386,45 @@ class WhatsAppAdapter {
     // Wait for the menu with "Photos & videos" and "Text" to appear
     await this.page.waitForTimeout(2000);
 
-    // Click "Photos & videos" option - this triggers the file chooser
+    // Click "Photos & videos" option from the dropdown menu
+    // This triggers the native file chooser dialog
     try {
         const [fileChooser] = await Promise.all([
             this.page.waitForEvent('filechooser', { timeout: 15000 }),
             (async () => {
-                // Try "Photos & videos" text
-                const photosOption = this.page.getByText('Photos & videos');
-                if (await photosOption.isVisible({ timeout: 3000 })) {
-                    await photosOption.click();
-                    logger.info('Clicked "Photos & videos" option');
-                    return;
-                }
-                // Fallback: try "Photo" or "Video" partial match
-                const photoBtn = this.page.locator('[aria-label*="Photo"], [aria-label*="photo"], [aria-label*="image"], [aria-label*="Image"]').first();
-                if (await photoBtn.isVisible({ timeout: 2000 })) {
-                    await photoBtn.click();
-                    logger.info('Clicked photo option via aria-label');
-                    return;
-                }
-                // Last resort: click input[type=file] directly
-                const fileInput = await this.page.$('input[type="file"]');
-                if (fileInput) {
-                    await fileInput.click();
-                    logger.info('Clicked input[type=file] directly');
+                // Use page.evaluate to find and click "Photos & videos" by text content
+                // This is more reliable than getByText for menus with icons
+                const clicked = await this.page.evaluate(() => {
+                    const elements = document.querySelectorAll('span, div, li, button, [role="menuitem"], [role="button"]');
+                    for (const el of elements) {
+                        const text = el.textContent.trim();
+                        if (text === 'Photos & videos' || text === 'Photos &amp; videos' || text.includes('Photos') && text.includes('videos')) {
+                            el.click();
+                            return 'found-text';
+                        }
+                    }
+                    // Try by aria-label
+                    const labeled = document.querySelector('[aria-label*="Photo"], [aria-label*="photo"]');
+                    if (labeled) { labeled.click(); return 'found-aria'; }
+                    return null;
+                });
+                
+                if (clicked) {
+                    logger.info('Clicked Photos & videos via: ' + clicked);
+                } else {
+                    // Fallback: try Playwright locator with partial text
+                    const photosLocator = this.page.locator(':text("Photos")').first();
+                    if (await photosLocator.isVisible({ timeout: 2000 })) {
+                        await photosLocator.click();
+                        logger.info('Clicked Photos via locator partial text');
+                    } else {
+                        // Ultra fallback: click first item in the dropdown
+                        const firstItem = this.page.locator('[role="menuitem"], [role="option"], li').first();
+                        if (await firstItem.isVisible({ timeout: 1000 })) {
+                            await firstItem.click();
+                            logger.info('Clicked first menu item as fallback');
+                        }
+                    }
                 }
             })()
         ]);
