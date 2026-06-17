@@ -310,183 +310,203 @@ class WhatsAppAdapter {
      * @returns {Promise<{success: true} | {success: false, error: string}>}
      */
     async _executePublishWorkflow(mediaPath, caption) {
-    await this._ensureInitialized();
+        await this._ensureInitialized();
 
-    const settingsService = require('../services/SettingsService');
-    const settings = settingsService.get();
-    const whatsappUrl = settings.whatsAppWebUrl || config.DEFAULT_WHATSAPP_WEB_URL;
+        const settingsService = require('../services/SettingsService');
+        const settings = settingsService.get();
+        const whatsappUrl = settings.whatsAppWebUrl || config.DEFAULT_WHATSAPP_WEB_URL;
 
-    // Navigate to WhatsApp Web
-    await this.page.goto(whatsappUrl, {
-        waitUntil: 'networkidle',
-        timeout: config.PLAYWRIGHT_TIMEOUT_MS
-    });
+        // Navigate to WhatsApp Web
+        await this.page.goto(whatsappUrl, {
+            waitUntil: 'networkidle',
+            timeout: config.PLAYWRIGHT_TIMEOUT_MS
+        });
 
-    // Wait for page to settle
-    await this.page.waitForTimeout(5000);
+        // Wait for page to settle
+        await this.page.waitForTimeout(5000);
 
-    // Check login status
-    const loggedInSelectors = ['[data-testid="chat-list"]', '[data-testid="chatlist"]', '#pane-side', '[data-testid="default-user"]', 'div[data-tab="3"]'];
-    let isLoggedIn = false;
-    for (const selector of loggedInSelectors) {
-        if (await this.page.$(selector)) { isLoggedIn = true; break; }
-    }
+        // Check login status
+        const loggedInSelectors = ['[data-testid="chat-list"]', '[data-testid="chatlist"]', '#pane-side', '[data-testid="default-user"]', 'div[data-tab="3"]'];
+        let isLoggedIn = false;
+        for (const selector of loggedInSelectors) {
+            if (await this.page.$(selector)) { isLoggedIn = true; break; }
+        }
 
-    if (!isLoggedIn) {
-        logService.create({ eventType: 'LOGIN_REQUIRED', message: 'Cannot publish: WhatsApp Web requires QR code scan' });
-        return { success: false, error: 'WhatsApp Web requires QR code scan' };
-    }
+        if (!isLoggedIn) {
+            logService.create({ eventType: 'LOGIN_REQUIRED', message: 'Cannot publish: WhatsApp Web requires QR code scan' });
+            return { success: false, error: 'WhatsApp Web requires QR code scan' };
+        }
 
-    // --- STEP 1: Click Status tab ---
-    const statusTabFound = await this.page.evaluate(() => {
-        const el = document.querySelector('[title="Status"], [aria-label="Status"], [data-testid="status-v3-tab"]');
-        if (el) { el.click(); return true; }
-        const navItems = document.querySelectorAll('nav button, nav [role="button"]');
-        if (navItems.length >= 2) { navItems[1].click(); return true; }
-        return false;
-    });
+        // --- STEP 1: Click Status tab ---
+        const statusTabFound = await this.page.evaluate(() => {
+            const el = document.querySelector('[title="Status"], [aria-label="Status"], [data-testid="status-v3-tab"]');
+            if (el) { el.click(); return true; }
+            const navItems = document.querySelectorAll('nav button, nav [role="button"]');
+            if (navItems.length >= 2) { navItems[1].click(); return true; }
+            return false;
+        });
 
-    if (!statusTabFound) {
-        const fallback = await this.page.$('[aria-label*="tatus"]');
-        if (fallback) { await fallback.click(); }
-        else { return { success: false, error: 'Could not find Status tab' }; }
-    }
+        if (!statusTabFound) {
+            const fallback = await this.page.$('[aria-label*="tatus"]');
+            if (fallback) { await fallback.click(); }
+            else { return { success: false, error: 'Could not find Status tab' }; }
+        }
 
-    await this.page.waitForTimeout(3000);
+        await this.page.waitForTimeout(3000);
 
-    // --- STEP 2: Click "My status" and handle file upload ---
-    // Use Playwright's locator with text matching and fileChooser event
-    let fileUploaded = false;
+        // --- STEP 2: Click "My status", then "Photos & videos", then handle file upload ---
+        let fileUploaded = false;
 
-    // Try using Playwright's text-based locator to click "Click to add status update"
-    try {
-        const addStatusLink = this.page.getByText('Click to add status update');
-        if (await addStatusLink.isVisible({ timeout: 3000 })) {
+        // First, click "My status" or "Click to add status update"
+        try {
+            const addStatusLink = this.page.getByText('Click to add status update');
+            if (await addStatusLink.isVisible({ timeout: 3000 })) {
+                await addStatusLink.click();
+                logger.info('Clicked "Click to add status update"');
+            } else {
+                const myStatus = this.page.getByText('My status', { exact: true });
+                if (await myStatus.isVisible({ timeout: 2000 })) {
+                    await myStatus.click();
+                    logger.info('Clicked "My status"');
+                }
+            }
+        } catch (e) {
+            logger.info('Could not click My status text, trying + button');
+            try {
+                const plusBtn = this.page.locator('[aria-label*="Add"], [aria-label*="add"], [data-icon="plus"]').first();
+                if (await plusBtn.isVisible({ timeout: 2000 })) {
+                    await plusBtn.click();
+                    logger.info('Clicked + button');
+                }
+            } catch (e2) {
+                return { success: false, error: 'Could not find My status or add button' };
+            }
+        }
+
+        // Wait for the menu with "Photos & videos" and "Text" options to appear
+        await this.page.waitForTimeout(1500);
+
+        // Click "Photos & videos" option - this will trigger the file chooser
+        try {
             const [fileChooser] = await Promise.all([
                 this.page.waitForEvent('filechooser', { timeout: 10000 }),
-                addStatusLink.click()
+                (async () => {
+                    // Try multiple ways to find and click "Photos & videos"
+                    const photosOption = this.page.getByText('Photos & videos');
+                    if (await photosOption.isVisible({ timeout: 3000 })) {
+                        await photosOption.click();
+                        logger.info('Clicked "Photos & videos" option');
+                        return;
+                    }
+                    // Fallback: try partial text match
+                    const photoAlt = this.page.locator('text=/photo|Photo|image|Image|video|Video/i').first();
+                    if (await photoAlt.isVisible({ timeout: 2000 })) {
+                        await photoAlt.click();
+                        logger.info('Clicked photo/video option via regex');
+                        return;
+                    }
+                    // Fallback: click first menu item (Photos is usually first)
+                    const menuItems = this.page.locator('[role="button"], [role="menuitem"], li').first();
+                    await menuItems.click();
+                    logger.info('Clicked first menu item as fallback');
+                })()
             ]);
+
             await fileChooser.setFiles(mediaPath);
             fileUploaded = true;
-            logger.info('File uploaded via "Click to add status update" + fileChooser');
-        }
-    } catch (e) {
-        logger.info('Approach 1 (getByText) did not work: ' + e.message);
-    }
-
-    // Fallback: try clicking "My status" text
-    if (!fileUploaded) {
-        try {
-            const myStatus = this.page.getByText('My status', { exact: true });
-            if (await myStatus.isVisible({ timeout: 2000 })) {
-                const [fileChooser] = await Promise.all([
-                    this.page.waitForEvent('filechooser', { timeout: 10000 }),
-                    myStatus.click()
-                ]);
-                await fileChooser.setFiles(mediaPath);
-                fileUploaded = true;
-                logger.info('File uploaded via "My status" click + fileChooser');
-            }
+            logger.info('File uploaded via fileChooser after Photos & videos click');
         } catch (e) {
-            logger.info('Approach 2 (My status text) did not work: ' + e.message);
+            logger.info('Photos & videos + fileChooser approach failed: ' + e.message);
         }
-    }
 
-    // Fallback: try the + button then look for input[type=file]
-    if (!fileUploaded) {
-        try {
-            // Click + button
-            const plusBtn = this.page.locator('[aria-label*="Add"], [aria-label*="add"], [data-icon="plus"]').first();
-            if (await plusBtn.isVisible({ timeout: 2000 })) {
-                await plusBtn.click();
-                await this.page.waitForTimeout(1500);
+        // Fallback: try finding input[type=file] directly
+        if (!fileUploaded) {
+            try {
+                const fileInput = await this.page.$('input[type="file"]');
+                if (fileInput) {
+                    await fileInput.setInputFiles(mediaPath);
+                    fileUploaded = true;
+                    logger.info('File uploaded via input[type=file] fallback');
+                }
+            } catch (e) {
+                logger.info('input[type=file] fallback failed: ' + e.message);
             }
-            // Look for file input
-            const fileInput = await this.page.$('input[type="file"]');
-            if (fileInput) {
-                await fileInput.setInputFiles(mediaPath);
-                fileUploaded = true;
-                logger.info('File uploaded via + button then input[type=file]');
-            }
-        } catch (e) {
-            logger.info('Approach 3 (+ button) did not work: ' + e.message);
         }
-    }
 
-    if (!fileUploaded) {
-        return { success: false, error: 'Could not find file upload input' };
-    }
-
-    // --- STEP 3: Wait for media to load, enter caption ---
-    await this.page.waitForTimeout(3000);
-
-    if (caption) {
-        const captionInput = await this.page.$('[contenteditable="true"]');
-        if (captionInput) {
-            await captionInput.click();
-            await this.page.keyboard.type(caption);
-        } else {
-            logger.warn('Caption input not found, proceeding without caption');
+        if (!fileUploaded) {
+            return { success: false, error: 'Could not find file upload input' };
         }
-    }
 
-    // --- STEP 4: Click send button ---
-    const sendClicked = await this.page.evaluate(() => {
-        const selectors = ['[data-testid="send"]', '[data-testid="media-upload-btn"]', '[aria-label="Send"]', '[data-testid="status-v3-send"]'];
-        for (const sel of selectors) {
-            const el = document.querySelector(sel);
-            if (el) { el.click(); return true; }
-        }
-        const sendBtns = document.querySelectorAll('[data-icon="send"], button[aria-label*="end"]');
-        if (sendBtns.length > 0) { sendBtns[0].click(); return true; }
-        return false;
-    });
+        // --- STEP 3: Wait for media to load, enter caption ---
+        await this.page.waitForTimeout(3000);
 
-    if (!sendClicked) {
-        // Try Playwright locator for send
-        try {
-            const sendBtn = this.page.locator('[aria-label="Send"], [data-testid="send"]').first();
-            if (await sendBtn.isVisible({ timeout: 3000 })) {
-                await sendBtn.click();
+        if (caption) {
+            const captionInput = await this.page.$('[contenteditable="true"]');
+            if (captionInput) {
+                await captionInput.click();
+                await this.page.keyboard.type(caption);
             } else {
+                logger.warn('Caption input not found, proceeding without caption');
+            }
+        }
+
+        // --- STEP 4: Click send button ---
+        const sendClicked = await this.page.evaluate(() => {
+            const selectors = ['[data-testid="send"]', '[data-testid="media-upload-btn"]', '[aria-label="Send"]', '[data-testid="status-v3-send"]'];
+            for (const sel of selectors) {
+                const el = document.querySelector(sel);
+                if (el) { el.click(); return true; }
+            }
+            const sendBtns = document.querySelectorAll('[data-icon="send"], button[aria-label*="end"]');
+            if (sendBtns.length > 0) { sendBtns[0].click(); return true; }
+            return false;
+        });
+
+        if (!sendClicked) {
+            // Try Playwright locator for send
+            try {
+                const sendBtn = this.page.locator('[aria-label="Send"], [data-testid="send"]').first();
+                if (await sendBtn.isVisible({ timeout: 3000 })) {
+                    await sendBtn.click();
+                } else {
+                    return { success: false, error: 'Could not find send button' };
+                }
+            } catch {
                 return { success: false, error: 'Could not find send button' };
             }
-        } catch {
-            return { success: false, error: 'Could not find send button' };
         }
-    }
 
-    // --- STEP 5: Wait and verify ---
-    await this.page.waitForTimeout(4000);
-    return { success: true };
-}
+        // --- STEP 5: Wait and verify ---
+        await this.page.waitForTimeout(4000);
+        return { success: true };
+    }
 
     /**
      * Verifies that the status was published successfully.
      * @returns {Promise<boolean>}
      */
     async _verifyStatusPublished() {
-    try {
-        await this.page.waitForTimeout(2000);
-        return true; // If we got here without error, consider it published
-    } catch {
-        return false;
+        try {
+            await this.page.waitForTimeout(2000);
+            return true; // If we got here without error, consider it published
+        } catch {
+            return false;
+        }
     }
-}
 
     /**
      * Closes browser gracefully within 10 seconds on error.
      */
     async _closeGracefully() {
-    try {
-        await this.close();
-    } catch (err) {
-        logger.warn('Graceful close failed during error handling', { error: err.message });
-        this.context = null;
-        this.page = null;
-        this._isInitialized = false;
+        try {
+            await this.close();
+        } catch (err) {
+            logger.warn('Graceful close failed during error handling', { error: err.message });
+            this.context = null;
+            this.page = null;
+            this._isInitialized = false;
+        }
     }
-}
 }
 
 module.exports = new WhatsAppAdapter();
