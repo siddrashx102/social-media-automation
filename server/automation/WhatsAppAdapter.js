@@ -386,45 +386,53 @@ class WhatsAppAdapter {
     // Wait for the menu with "Photos & videos" and "Text" to appear
     await this.page.waitForTimeout(2000);
 
-    // Click "Photos & videos" option from the dropdown menu
-    // This triggers the native file chooser dialog
+    // Click "Photos & videos" - the FIRST option in the dropdown menu
+    // The dropdown has 2 items: "Photos & videos" (first) and "Text" (second)
     try {
         const [fileChooser] = await Promise.all([
             this.page.waitForEvent('filechooser', { timeout: 15000 }),
             (async () => {
-                // Use page.evaluate to find and click "Photos & videos" by text content
-                // This is more reliable than getByText for menus with icons
+                // Strategy: The dropdown is a small popup menu. "Photos & videos" is the first clickable item.
+                // We'll use multiple approaches to find and click it.
+                
+                // Approach 1: Find all visible popup/menu items and click the first one
+                // (Photos & videos is always the first option)
                 const clicked = await this.page.evaluate(() => {
-                    const elements = document.querySelectorAll('span, div, li, button, [role="menuitem"], [role="button"]');
-                    for (const el of elements) {
-                        const text = el.textContent.trim();
-                        if (text === 'Photos & videos' || text === 'Photos &amp; videos' || text.includes('Photos') && text.includes('videos')) {
-                            el.click();
-                            return 'found-text';
+                    // Look for elements containing "Photo" text (partial match)
+                    const allEls = document.querySelectorAll('*');
+                    for (const el of allEls) {
+                        // Only check leaf nodes or elements with short direct text
+                        if (el.children.length === 0 || el.childElementCount <= 2) {
+                            const text = el.innerText || el.textContent || '';
+                            if (text.includes('Photo') && !text.includes('Recent') && text.length < 50) {
+                                el.click();
+                                return 'clicked-photo-text: ' + text.substring(0, 30);
+                            }
                         }
                     }
-                    // Try by aria-label
-                    const labeled = document.querySelector('[aria-label*="Photo"], [aria-label*="photo"]');
-                    if (labeled) { labeled.click(); return 'found-aria'; }
                     return null;
                 });
                 
                 if (clicked) {
-                    logger.info('Clicked Photos & videos via: ' + clicked);
-                } else {
-                    // Fallback: try Playwright locator with partial text
-                    const photosLocator = this.page.locator(':text("Photos")').first();
-                    if (await photosLocator.isVisible({ timeout: 2000 })) {
-                        await photosLocator.click();
-                        logger.info('Clicked Photos via locator partial text');
-                    } else {
-                        // Ultra fallback: click first item in the dropdown
-                        const firstItem = this.page.locator('[role="menuitem"], [role="option"], li').first();
-                        if (await firstItem.isVisible({ timeout: 1000 })) {
-                            await firstItem.click();
-                            logger.info('Clicked first menu item as fallback');
-                        }
+                    logger.info('Photos & videos clicked via evaluate: ' + clicked);
+                    return;
+                }
+
+                // Approach 2: Use Playwright locator with has-text
+                try {
+                    const menuItem = this.page.locator('div, span, li, button').filter({ hasText: /Photo/ }).first();
+                    if (await menuItem.isVisible({ timeout: 2000 })) {
+                        await menuItem.click();
+                        logger.info('Clicked via Playwright filter hasText Photo');
+                        return;
                     }
+                } catch (e) { /* continue */ }
+
+                // Approach 3: Click input[type=file] if it appeared
+                const fileInput = await this.page.$('input[type="file"]');
+                if (fileInput) {
+                    await fileInput.click();
+                    logger.info('Clicked input[type=file] directly');
                 }
             })()
         ]);
