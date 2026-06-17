@@ -46,9 +46,14 @@ router.get('/:id', (req, res, next) => {
 router.post('/', upload.single('media'), (req, res, next) => {
     try {
         const media = req.file;
-        const { caption, scheduledAt } = req.body;
+        const { caption, scheduledAt, frequencyDays } = req.body;
 
-        const status = statusService.create({ media, caption: caption || null, scheduledAt: scheduledAt || null });
+        const status = statusService.create({
+            media,
+            caption: caption || null,
+            scheduledAt: scheduledAt || null,
+            frequencyDays: frequencyDays ? parseInt(frequencyDays) : null
+        });
         res.status(201).json(status);
     } catch (err) {
         next(err);
@@ -103,7 +108,7 @@ router.post('/:id/publish-now', async (req, res, next) => {
         setImmediate(async () => {
             try {
                 if (!whatsAppAdapter._isInitialized) {
-                    await whatsAppAdapter.initialize(settings.playwrightProfilePath, settings.headlessMode);
+                    await whatsAppAdapter.initialize(settings.playwrightProfilePath, settings.headlessMode, settings.slowMoMs);
                 }
                 const result = await whatsAppAdapter.publish(mediaPath, status.caption);
 
@@ -138,7 +143,7 @@ router.post('/:id/retry', async (req, res, next) => {
         setImmediate(async () => {
             try {
                 if (!whatsAppAdapter._isInitialized) {
-                    await whatsAppAdapter.initialize(settings.playwrightProfilePath, settings.headlessMode);
+                    await whatsAppAdapter.initialize(settings.playwrightProfilePath, settings.headlessMode, settings.slowMoMs);
                 }
                 const result = await whatsAppAdapter.publish(mediaPath, status.caption);
 
@@ -152,6 +157,19 @@ router.post('/:id/retry', async (req, res, next) => {
             }
         });
 
+        res.json(status);
+    } catch (err) {
+        next(err);
+    }
+});
+
+/**
+ * POST /api/statuses/:id/stop-recurring
+ * Stop a recurring status from re-scheduling.
+ */
+router.post('/:id/stop-recurring', (req, res, next) => {
+    try {
+        const status = statusService.stopRecurring(req.params.id);
         res.json(status);
     } catch (err) {
         next(err);

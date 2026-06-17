@@ -1,0 +1,3 @@
+-- Add recurring status fields
+ALTER TABLE statuses ADD COLUMN frequencyDays INTEGER DEFAULT NULL;
+ALTER TABLE statuses ADD COLUMN isRecurring INTEGER NOT NULL DEFAULT 0;

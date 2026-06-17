@@ -15,6 +15,9 @@ function StatusForm({ existingStatus = null, onSuccess }) {
     const [scheduledAt, setScheduledAt] = useState(
         existingStatus?.scheduledAt ? formatDateForInput(existingStatus.scheduledAt) : ''
     );
+    const [frequencyDays, setFrequencyDays] = useState(
+        existingStatus?.frequencyDays || ''
+    );
     const [errors, setErrors] = useState({});
     const [submitting, setSubmitting] = useState(false);
     const [submitError, setSubmitError] = useState(null);
@@ -79,6 +82,7 @@ function StatusForm({ existingStatus = null, onSuccess }) {
                 formData.append('media', media);
                 if (caption) formData.append('caption', caption);
                 if (scheduledAt) formData.append('scheduledAt', new Date(scheduledAt).toISOString());
+                if (frequencyDays) formData.append('frequencyDays', frequencyDays);
 
                 await api.post('/statuses', formData, {
                     headers: { 'Content-Type': 'multipart/form-data' }
@@ -220,6 +224,26 @@ function StatusForm({ existingStatus = null, onSuccess }) {
                 <div className="invalid-feedback">{errors.scheduledAt}</div>
                 <div className="form-text">
                     Leave empty to save as draft. Must be at least 5 minutes in the future.
+                </div>
+            </div>
+
+            {/* Recurring Frequency */}
+            <div className="mb-3">
+                <label htmlFor="frequencyDays" className="form-label">Repeat Frequency</label>
+                <select
+                    className="form-select"
+                    id="frequencyDays"
+                    value={frequencyDays}
+                    onChange={(e) => setFrequencyDays(e.target.value)}
+                >
+                    <option value="">No repeat (one-time)</option>
+                    <option value="1">Every day</option>
+                    <option value="2">Every 2 days</option>
+                    <option value="3">Every 3 days</option>
+                    <option value="7">Every 7 days (weekly)</option>
+                </select>
+                <div className="form-text">
+                    If set, the status will be automatically re-published at the same time based on the frequency.
                 </div>
             </div>
 

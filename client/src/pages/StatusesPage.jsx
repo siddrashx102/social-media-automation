@@ -83,6 +83,16 @@ function StatusesPage() {
         }
     }
 
+    async function handleStopRecurring(statusId) {
+        setActionError(null);
+        try {
+            await api.post(`/statuses/${statusId}/stop-recurring`);
+            await fetchStatuses();
+        } catch (err) {
+            setActionError(err.message);
+        }
+    }
+
     async function handleConfirm() {
         const { statusId, action } = confirmDialog;
         setConfirmDialog({ ...confirmDialog, show: false });
@@ -142,6 +152,7 @@ function StatusesPage() {
                 onDelete={handleDelete}
                 onPublish={handlePublish}
                 onRetry={handleRetry}
+                onStopRecurring={handleStopRecurring}
             />
 
             {/* Pagination */}

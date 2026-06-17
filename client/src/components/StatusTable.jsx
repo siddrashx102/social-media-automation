@@ -1,6 +1,6 @@
 import { useNavigate } from 'react-router-dom';
 
-function StatusTable({ statuses, onDelete, onPublish, onRetry }) {
+function StatusTable({ statuses, onDelete, onPublish, onRetry, onStopRecurring }) {
     const navigate = useNavigate();
 
     function getStateBadge(state) {
@@ -59,7 +59,14 @@ function StatusTable({ statuses, onDelete, onPublish, onRetry }) {
                             </td>
                             <td>{truncateCaption(status.caption)}</td>
                             <td className="text-nowrap">{formatDate(status.scheduledAt)}</td>
-                            <td>{getStateBadge(status.state)}</td>
+                            <td>
+                                {getStateBadge(status.state)}
+                                {status.isRecurring ? (
+                                    <span className="badge bg-info ms-1" title={`Repeats every ${status.frequencyDays} day(s)`}>
+                                        <i className="bi bi-arrow-repeat"></i> {status.frequencyDays}d
+                                    </span>
+                                ) : null}
+                            </td>
                             <td className="text-nowrap">{formatDate(status.createdAt)}</td>
                             <td>
                                 <div className="btn-group btn-group-sm">
@@ -95,6 +102,17 @@ function StatusTable({ statuses, onDelete, onPublish, onRetry }) {
                                             <i className="bi bi-arrow-clockwise"></i>
                                         </button>
                                     )}
+
+                                    {/* Stop Recurring - only for recurring statuses */}
+                                    {status.isRecurring ? (
+                                        <button
+                                            className="btn btn-outline-secondary"
+                                            title="Stop Recurring"
+                                            onClick={() => onStopRecurring(status.id)}
+                                        >
+                                            <i className="bi bi-stop-circle"></i>
+                                        </button>
+                                    ) : null}
 
                                     {/* Delete - always available */}
                                     <button

@@ -19,9 +19,10 @@ class StatusService {
      * @param {object} params.media - Multer file object
      * @param {string|null} [params.caption] - Optional caption (max 700 chars)
      * @param {string|null} [params.scheduledAt] - Optional ISO 8601 schedule time
+     * @param {number|null} [params.frequencyDays] - Optional recurring frequency in days
      * @returns {object} Created status record
      */
-    create({ media, caption = null, scheduledAt = null }) {
+    create({ media, caption = null, scheduledAt = null, frequencyDays = null }) {
         // Validate media is provided
         if (!media) {
             const error = new Error('Media file is required');
@@ -59,11 +60,12 @@ class StatusService {
 
         const db = getDatabase();
         const stmt = db.prepare(`
-      INSERT INTO statuses (id, mediaPath, mediaType, originalFilename, caption, state, scheduledAt, retryCount, createdAt, updatedAt)
-      VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+      INSERT INTO statuses (id, mediaPath, mediaType, originalFilename, caption, state, scheduledAt, retryCount, frequencyDays, isRecurring, createdAt, updatedAt)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
     `);
 
-        stmt.run(id, media.filename, mediaType, media.originalname, caption || null, state, scheduledAt || null, now, now);
+        const isRecurring = frequencyDays && frequencyDays > 0 ? 1 : 0;
+        stmt.run(id, media.filename, mediaType, media.originalname, caption || null, state, scheduledAt || null, frequencyDays || null, isRecurring, now, now);
 
         // Log event
         const eventType = state === 'scheduled' ? 'STATUS_SCHEDULED' : 'STATUS_CREATED';
@@ -222,15 +224,65 @@ class StatusService {
 
     /**
      * Marks a status as successfully posted.
+     * If the status is recurring, automatically re-schedules it for the next occurrence.
      * @param {string} id
      */
     markPosted(id) {
+        const status = this.getById(id);
         this._updateState(id, 'posted');
         logService.create({
             statusId: id,
             eventType: 'STATUS_POSTED',
             message: 'Status published successfully'
         });
+
+        // If recurring, re-schedule for next occurrence
+        if (status && status.isRecurring && status.frequencyDays > 0) {
+            this._rescheduleRecurring(id, status);
+        }
+    }
+
+    /**
+     * Re-schedules a recurring status for the next occurrence.
+     * @param {string} id
+     * @param {object} status
+     */
+    _rescheduleRecurring(id, status) {
+        const db = getDatabase();
+        const now = new Date();
+        const lastScheduled = status.scheduledAt ? new Date(status.scheduledAt) : now;
+        const nextScheduled = new Date(lastScheduled.getTime() + status.frequencyDays * 24 * 60 * 60 * 1000);
+
+        // If next scheduled is in the past (e.g., missed cycles), push to next valid time
+        while (nextScheduled <= now) {
+            nextScheduled.setTime(nextScheduled.getTime() + status.frequencyDays * 24 * 60 * 60 * 1000);
+        }
+
+        db.prepare(
+            'UPDATE statuses SET state = ?, scheduledAt = ?, retryCount = 0, updatedAt = ? WHERE id = ?'
+        ).run('scheduled', nextScheduled.toISOString(), now.toISOString(), id);
+
+        logService.create({
+            statusId: id,
+            eventType: 'STATUS_SCHEDULED',
+            message: `Recurring status re-scheduled for ${nextScheduled.toLocaleString()}`
+        });
+
+        logger.info(`Recurring status ${id} re-scheduled`, { nextScheduled: nextScheduled.toISOString(), frequencyDays: status.frequencyDays });
+    }
+
+    /**
+     * Stops a recurring status from re-scheduling.
+     * @param {string} id
+     * @returns {object} Updated status
+     */
+    stopRecurring(id) {
+        const status = this._getOrThrow(id);
+        const db = getDatabase();
+        const now = new Date().toISOString();
+        db.prepare('UPDATE statuses SET isRecurring = 0, frequencyDays = NULL, updatedAt = ? WHERE id = ?').run(now, id);
+        logger.info(`Recurring stopped for status ${id}`);
+        return this.getById(id);
     }
 
     /**
