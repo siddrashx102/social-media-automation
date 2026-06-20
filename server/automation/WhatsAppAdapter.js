@@ -67,11 +67,15 @@ class WhatsAppAdapter {
                 return { success: false, error: 'Media file not found' };
             }
 
-            // Create timeout promise (30 seconds)
+            // Timeout for the WHOLE publish workflow. This is intentionally separate
+            // from (and longer than) the per-action Playwright timeout: the flow
+            // includes navigation, several deliberate waits, optional slowMo, the file
+            // chooser, and upload — which easily exceed the per-action 30s budget.
+            const workflowTimeoutMs = config.PUBLISH_WORKFLOW_TIMEOUT_MS || config.PLAYWRIGHT_TIMEOUT_MS;
             const timeoutPromise = new Promise((_, reject) => {
                 timeoutHandle = setTimeout(() => {
-                    reject(new Error('Operation timed out after 30 seconds'));
-                }, config.PLAYWRIGHT_TIMEOUT_MS);
+                    reject(new Error(`Operation timed out after ${Math.round(workflowTimeoutMs / 1000)} seconds`));
+                }, workflowTimeoutMs);
             });
 
             // Execute publish workflow with timeout
@@ -300,11 +304,6 @@ class WhatsAppAdapter {
 
     /**
      * Executes the full publish workflow on WhatsApp Web.
-// This file contains the _executePublishWorkflow and related methods
-// It will be merged into WhatsAppAdapter.js
-
-    /**
-     * Executes the full publish workflow on WhatsApp Web.
      * @param {string} mediaPath - Absolute path to media file
      * @param {string|null} caption - Optional caption
      * @returns {Promise<{success: true} | {success: false, error: string}>}
@@ -316,17 +315,24 @@ class WhatsAppAdapter {
         const settings = settingsService.get();
         const whatsappUrl = settings.whatsAppWebUrl || config.DEFAULT_WHATSAPP_WEB_URL;
 
-        // Navigate to WhatsApp Web
+        // Navigate to WhatsApp Web. Use `domcontentloaded` — `networkidle` rarely
+        // settles on WhatsApp Web because of its long-lived websocket/XHR traffic,
+        // which can burn the whole timeout budget before the workflow even starts.
         await this.page.goto(whatsappUrl, {
-            waitUntil: 'networkidle',
+            waitUntil: 'domcontentloaded',
             timeout: config.PLAYWRIGHT_TIMEOUT_MS
         });
 
-        // Wait for page to settle
-        await this.page.waitForTimeout(5000);
+        // Wait for the logged-in app shell to render (chat list), then re-check below.
+        const loggedInSelectors = ['[data-testid="chat-list"]', '[data-testid="chatlist"]', '#pane-side', '[data-testid="default-user"]', 'div[data-tab="3"]'];
+        try {
+            await this.page.waitForSelector(loggedInSelectors.join(', '), { timeout: 20000 });
+        } catch {
+            // Not found in time — fall back to a fixed settle wait; login is re-checked below.
+            await this.page.waitForTimeout(5000);
+        }
 
         // Check login status
-        const loggedInSelectors = ['[data-testid="chat-list"]', '[data-testid="chatlist"]', '#pane-side', '[data-testid="default-user"]', 'div[data-tab="3"]'];
         let isLoggedIn = false;
         for (const selector of loggedInSelectors) {
             if (await this.page.$(selector)) { isLoggedIn = true; break; }
@@ -353,136 +359,301 @@ class WhatsAppAdapter {
         }
 
         await this.page.waitForTimeout(3000);
+        await this._debugSnapshot('step1-status-tab');
 
-        // --- STEP 2: Click "My status", then upload file via hidden input ---
-    // WhatsApp Web has a hidden input[type="file"] in the DOM.
-    // After clicking "My status", a menu appears with "Photos & videos" / "Text".
-    // Instead of clicking "Photos & videos" and waiting for fileChooser (unreliable),
-    // we directly find the hidden file input and set files on it.
-    let fileUploaded = false;
-
-    // Click "My status" to activate the status upload area
-    try {
-        const addStatusLink = this.page.getByText('Click to add status update');
-        if (await addStatusLink.isVisible({ timeout: 3000 })) {
-            await addStatusLink.click();
-            logger.info('Clicked "Click to add status update"');
-        } else {
-            const myStatus = this.page.getByText('My status', { exact: true });
-            if (await myStatus.isVisible({ timeout: 2000 })) {
-                await myStatus.click();
-                logger.info('Clicked "My status"');
-            }
-        }
-    } catch (e) {
-        // Try + button
-        try {
-            const plusBtn = this.page.locator('[aria-label*="Add"], [aria-label*="add"]').first();
-            if (await plusBtn.isVisible({ timeout: 2000 })) {
-                await plusBtn.click();
-            }
-        } catch (e2) {
-            return { success: false, error: 'Could not find My status or add button' };
-        }
-    }
-
-    await this.page.waitForTimeout(2000);
-
-    // Now find the hidden input[type="file"] and set files directly
-    // WhatsApp Web puts a hidden file input in the DOM when the menu appears
-    // We can set files on it without needing to click "Photos & videos"
-    try {
-        // Look for input[type="file"] with accept attribute for images/videos
-        let fileInput = await this.page.$('input[type="file"][accept*="image"]');
-        if (!fileInput) {
-            fileInput = await this.page.$('input[type="file"][accept*="video"]');
-        }
-        if (!fileInput) {
-            fileInput = await this.page.$('input[type="file"]');
+        // --- STEP 2: Open the status composer and upload the media file ---
+        const uploadResult = await this._uploadStatusMedia(mediaPath);
+        if (!uploadResult.success) {
+            return uploadResult;
         }
 
-        if (fileInput) {
-            await fileInput.setInputFiles(mediaPath);
-            fileUploaded = true;
-            logger.info('File uploaded directly via hidden input[type=file]');
-        } else {
-            // If no input found yet, click "Photos & videos" text to make it appear
-            logger.info('No file input found, clicking Photos & videos option...');
-            
-            await this.page.evaluate(() => {
-                const allEls = document.querySelectorAll('*');
-                for (const el of allEls) {
-                    if (el.children.length <= 3) {
-                        const text = (el.innerText || '').trim();
-                        if (text.includes('Photo') && text.length < 50) {
-                            el.click();
-                            return true;
-                        }
-                    }
-                }
-                return false;
-            });
-
-            await this.page.waitForTimeout(1500);
-
-            // Try finding file input again after clicking
-            fileInput = await this.page.$('input[type="file"]');
-            if (fileInput) {
-                await fileInput.setInputFiles(mediaPath);
-                fileUploaded = true;
-                logger.info('File uploaded via input after clicking Photos option');
-            }
-        }
-    } catch (e) {
-        logger.error('File upload error: ' + e.message);
-    }
-
-    if (!fileUploaded) {
-        return { success: false, error: 'Could not upload file - no file input found in DOM' };
-    }
-
-    // --- STEP 3: Wait for media to load, enter caption ---
+        // --- STEP 3: Wait for the media preview, then enter the caption ---
         await this.page.waitForTimeout(3000);
+        await this._debugSnapshot('step3-media-preview');
 
         if (caption) {
-            const captionInput = await this.page.$('[contenteditable="true"]');
-            if (captionInput) {
-                await captionInput.click();
-                await this.page.keyboard.type(caption);
-            } else {
-                logger.warn('Caption input not found, proceeding without caption');
-            }
+            await this._enterCaption(caption);
         }
 
-        // --- STEP 4: Click send button ---
-        const sendClicked = await this.page.evaluate(() => {
-            const selectors = ['[data-testid="send"]', '[data-testid="media-upload-btn"]', '[aria-label="Send"]', '[data-testid="status-v3-send"]'];
-            for (const sel of selectors) {
-                const el = document.querySelector(sel);
-                if (el) { el.click(); return true; }
-            }
-            const sendBtns = document.querySelectorAll('[data-icon="send"], button[aria-label*="end"]');
-            if (sendBtns.length > 0) { sendBtns[0].click(); return true; }
-            return false;
-        });
-
-        if (!sendClicked) {
-            // Try Playwright locator for send
-            try {
-                const sendBtn = this.page.locator('[aria-label="Send"], [data-testid="send"]').first();
-                if (await sendBtn.isVisible({ timeout: 3000 })) {
-                    await sendBtn.click();
-                } else {
-                    return { success: false, error: 'Could not find send button' };
-                }
-            } catch {
-                return { success: false, error: 'Could not find send button' };
-            }
+        // --- STEP 4: Click send ---
+        const sent = await this._clickSend();
+        if (!sent) {
+            await this._debugSnapshot('step4-send-not-found');
+            return { success: false, error: 'Could not find send button' };
         }
 
         // --- STEP 5: Wait and verify ---
         await this.page.waitForTimeout(4000);
+        await this._debugSnapshot('step5-after-send');
         return { success: true };
+    }
+
+    /**
+     * Opens the status composer ("My status") and uploads the media file.
+     *
+     * The reliable sequence on current WhatsApp Web:
+     *   1. Click "My status" / "Click to add status update" to reveal the dropdown.
+     *   2. Wait for the dropdown ("Photos & videos" / "Text") to actually render.
+     *   3. Register a `filechooser` listener, THEN click "Photos & videos".
+     *      Playwright always intercepts the native OS dialog and emits `filechooser`,
+     *      so as long as the click reaches the real menu item this fires reliably.
+     *   4. Fall back to a directly-injected hidden <input type="file"> if no chooser opens.
+     *
+     * @param {string} mediaPath - Absolute path to the media file
+     * @returns {Promise<{success: true} | {success: false, error: string}>}
+     */
+    async _uploadStatusMedia(mediaPath) {
+        // 2a. Open the "My status" composer (reveals the Photos & videos / Text menu).
+        let opened = false;
+        const openers = [
+            () => this.page.getByText('Click to add status update', { exact: false }),
+            () => this.page.getByText('Add status', { exact: false }),
+            () => this.page.getByText('My status', { exact: true }),
+            () => this.page.locator('[aria-label="Add status"], [role="button"][aria-label*="status" i]').first()
+        ];
+        for (const make of openers) {
+            try {
+                const loc = make().first();
+                if (await loc.isVisible({ timeout: 2000 })) {
+                    await loc.click({ timeout: 2500 });
+                    opened = true;
+                    logger.info('Opened status composer ("My status")');
+                    break;
+                }
+            } catch (e) { /* try next opener */ }
+        }
+        if (!opened) {
+            // Last resort: a generic add / plus button.
+            try {
+                const plus = this.page.locator('[aria-label*="Add" i], span[data-icon="plus"], span[data-icon="plus-rounded"]').first();
+                if (await plus.isVisible({ timeout: 2000 })) {
+                    await plus.click();
+                    opened = true;
+                }
+            } catch (e) { /* ignore */ }
+        }
+        if (!opened) {
+            await this._debugSnapshot('step2-mystatus-not-found');
+            return { success: false, error: 'Could not open "My status" composer. See server/debug/step2-mystatus-not-found.{png,html}' };
+        }
+
+        // Wait for the dropdown ("Photos & videos" / "Text") to render, then snapshot it.
+        try {
+            await this.page.getByText(/photos?\s*&?\s*videos?/i).first().waitFor({ state: 'visible', timeout: 6000 });
+        } catch {
+            await this.page.waitForTimeout(1500);
+        }
+        await this._debugSnapshot('step2-status-menu');
+
+        // 2b. Click "Photos & videos" and capture the file chooser it opens.
+        const fileChooserPromise = this.page
+            .waitForEvent('filechooser', { timeout: 10000 })
+            .catch(() => null);
+
+        const clicked = await this._clickPhotosVideos();
+        if (!clicked) {
+            logger.warn('"Photos & videos" menu item not found by any strategy');
+        }
+
+        const fileChooser = await fileChooserPromise;
+        if (fileChooser) {
+            await fileChooser.setFiles(mediaPath);
+            logger.info('Media uploaded via file chooser');
+            return { success: true };
+        }
+
+        // 2c. Fallback: the click may have injected a hidden <input type="file"> in the
+        //     DOM instead of opening a native chooser — set files on it directly.
+        await this.page.waitForTimeout(1000);
+        if (await this._trySetInputFiles(mediaPath)) {
+            return { success: true };
+        }
+
+        await this._debugSnapshot('step2-upload-failed');
+        return {
+            success: false,
+            error: 'Could not upload media — "Photos & videos" did not open a file chooser and no file input was found. See server/debug/step2-upload-failed.{png,html}'
+        };
+    }
+
+    /**
+     * Clicks the "Photos & videos" item in the status composer dropdown.
+     * Cascades through Playwright locators (real, auto-waiting clicks) and finishes
+     * with a DOM pointer-event dispatch on the clickable ancestor of the matching text.
+     * @returns {Promise<boolean>}
+     */
+    async _clickPhotosVideos() {
+        const candidates = [
+            () => this.page.getByRole('button', { name: /photos?\s*&?\s*videos?/i }),
+            () => this.page.getByRole('menuitem', { name: /photos?\s*&?\s*videos?/i }),
+            () => this.page.getByText(/photos\s*&\s*videos/i),
+            () => this.page.getByText(/photos?\s*&?\s*videos?/i),
+            () => this.page.locator('[aria-label*="Photos" i]'),
+            () => this.page.locator('li:has-text("Photos"), [role="button"]:has-text("Photos")')
+        ];
+        for (const make of candidates) {
+            try {
+                const loc = make().first();
+                if (await loc.isVisible({ timeout: 1200 })) {
+                    await loc.scrollIntoViewIfNeeded({ timeout: 1000 }).catch(() => {});
+                    await loc.click({ timeout: 2500 });
+                    logger.info('Clicked "Photos & videos" (Playwright locator)');
+                    return true;
+                }
+            } catch (e) { /* try next strategy */ }
+        }
+
+        // DOM dispatch fallback: pick the SMALLEST element whose text matches (avoids
+        // clicking a big container), then dispatch a full pointer/mouse click on its
+        // nearest clickable ancestor.
+        const clicked = await this.page.evaluate(() => {
+            const full = /photos?\s*&\s*videos?/i;
+            const partial = /photo/i;
+            const nodes = Array.from(document.querySelectorAll('li, [role="button"], [role="menuitem"], button, span, div'));
+            let best = null;
+            for (const el of nodes) {
+                const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+                if (!t || t.length > 40) continue;
+                let rank = 0;
+                if (full.test(t)) rank = 2;
+                else if (partial.test(t)) rank = 1;
+                if (!rank) continue;
+                if (!best || rank > best.rank || (rank === best.rank && t.length < best.t.length)) {
+                    best = { el, t, rank };
+                }
+            }
+            if (!best) return false;
+            const target = best.el.closest('li, [role="button"], [role="menuitem"], button, [tabindex]') || best.el;
+            target.scrollIntoView({ block: 'center' });
+            const r = target.getBoundingClientRect();
+            const o = {
+                bubbles: true, cancelable: true, composed: true, view: window,
+                clientX: r.left + r.width / 2, clientY: r.top + r.height / 2, button: 0
+            };
+            const fire = (type, Ctor) => { try { target.dispatchEvent(new Ctor(type, o)); } catch (e) {} };
+            fire('pointerover', PointerEvent);
+            fire('pointerenter', PointerEvent);
+            fire('pointerdown', PointerEvent);
+            fire('mousedown', MouseEvent);
+            fire('pointerup', PointerEvent);
+            fire('mouseup', MouseEvent);
+            fire('click', MouseEvent);
+            return true;
+        });
+        if (clicked) logger.info('Clicked "Photos & videos" (DOM dispatch fallback)');
+        return clicked;
+    }
+
+    /**
+     * Finds a hidden file input that accepts images/videos and sets the media on it.
+     * `setInputFiles` works on hidden inputs and triggers WhatsApp's change handler.
+     * @param {string} mediaPath
+     * @returns {Promise<boolean>} whether files were set
+     */
+    async _trySetInputFiles(mediaPath) {
+        try {
+            const inputs = await this.page.$$('input[type="file"]');
+            if (inputs.length === 0) {
+                logger.info('No input[type=file] present in DOM');
+                return false;
+            }
+            logger.info(`Found ${inputs.length} file input(s); selecting an image/video-capable one`);
+            let chosen = null;
+            for (const input of inputs) {
+                const accept = (await input.getAttribute('accept')) || '';
+                if (/image|video/i.test(accept)) { chosen = input; break; }
+            }
+            chosen = chosen || inputs[0];
+            await chosen.setInputFiles(mediaPath);
+            logger.info('Media set on hidden file input');
+            return true;
+        } catch (e) {
+            logger.warn(`setInputFiles failed: ${e.message}`);
+            return false;
+        }
+    }
+
+    /**
+     * Types a caption into the media composer's contenteditable field.
+     * @param {string} caption
+     * @returns {Promise<boolean>}
+     */
+    async _enterCaption(caption) {
+        const candidates = [
+            () => this.page.getByRole('textbox', { name: /caption|message|type/i }),
+            () => this.page.locator('[aria-label*="caption" i][contenteditable="true"]'),
+            () => this.page.locator('[contenteditable="true"][data-tab]'),
+            () => this.page.locator('div[contenteditable="true"]').last()
+        ];
+        for (const make of candidates) {
+            try {
+                const loc = make().first();
+                if (await loc.isVisible({ timeout: 1500 })) {
+                    await loc.click();
+                    await this.page.keyboard.type(caption);
+                    logger.info('Caption entered');
+                    return true;
+                }
+            } catch (e) { /* try next */ }
+        }
+        logger.warn('Caption input not found, proceeding without caption');
+        return false;
+    }
+
+    /**
+     * Clicks the send button in the status media composer.
+     * @returns {Promise<boolean>}
+     */
+    async _clickSend() {
+        const candidates = [
+            () => this.page.getByRole('button', { name: /^send$/i }),
+            () => this.page.locator('[aria-label="Send"]'),
+            () => this.page.locator('span[data-icon="send"], span[data-icon="wds-ic-send-filled"]'),
+            () => this.page.locator('[data-testid="send"], [data-testid="status-v3-send"]')
+        ];
+        for (const make of candidates) {
+            try {
+                const loc = make().first();
+                if (await loc.isVisible({ timeout: 1500 })) {
+                    await loc.click({ timeout: 2500 });
+                    logger.info('Clicked send');
+                    return true;
+                }
+            } catch (e) { /* try next */ }
+        }
+        // DOM fallback
+        const clicked = await this.page.evaluate(() => {
+            const sel = ['[aria-label="Send"]', '[data-testid="send"]', '[data-testid="status-v3-send"]',
+                'span[data-icon="send"]', 'span[data-icon="wds-ic-send-filled"]', 'button[aria-label*="end"]'];
+            for (const s of sel) {
+                const el = document.querySelector(s);
+                if (el) { (el.closest('button, [role="button"]') || el).click(); return true; }
+            }
+            return false;
+        });
+        if (clicked) logger.info('Clicked send (DOM fallback)');
+        return clicked;
+    }
+
+    /**
+     * Saves a screenshot (and the page HTML) to server/debug/ for diagnosing failures.
+     * Best-effort: never throws.
+     * @param {string} tag - File name stem, e.g. "step2-status-menu"
+     * @param {boolean} [withHtml=true] - Also dump the page HTML alongside the screenshot
+     */
+    async _debugSnapshot(tag, withHtml = true) {
+        try {
+            const dir = path.join(__dirname, '..', 'debug');
+            if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+            const png = path.join(dir, `${tag}.png`);
+            await this.page.screenshot({ path: png });
+            if (withHtml) {
+                fs.writeFileSync(path.join(dir, `${tag}.html`), await this.page.content(), 'utf8');
+            }
+            logger.info(`Debug snapshot saved: ${png}`);
+        } catch (e) {
+            logger.warn(`Debug snapshot failed for "${tag}": ${e.message}`);
+        }
     }
 
     /**

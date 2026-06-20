@@ -116,7 +116,7 @@ class SchedulerService {
 
             // Ensure adapter is initialized
             if (!whatsAppAdapter._isInitialized) {
-                await whatsAppAdapter.initialize(settings.playwrightProfilePath, settings.headlessMode);
+                await whatsAppAdapter.initialize(settings.playwrightProfilePath, settings.headlessMode, settings.slowMoMs);
             }
 
             // Publish via WhatsApp adapter

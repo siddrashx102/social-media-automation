@@ -27,7 +27,8 @@ module.exports = {
 
     // Playwright
     DEFAULT_PLAYWRIGHT_PROFILE_PATH: path.join(__dirname, 'playwright-profile'),
-    PLAYWRIGHT_TIMEOUT_MS: 30000, // 30 seconds
+    PLAYWRIGHT_TIMEOUT_MS: 30000, // 30 seconds (per-action / navigation)
+    PUBLISH_WORKFLOW_TIMEOUT_MS: 120000, // 2 minutes (whole status-publish workflow)
 
     // WhatsApp
     DEFAULT_WHATSAPP_WEB_URL: 'https://web.whatsapp.com',
