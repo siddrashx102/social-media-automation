@@ -53,7 +53,21 @@ function runMigrations(database) {
     for (const file of migrationFiles) {
         const filePath = path.join(migrationsDir, file);
         const sql = fs.readFileSync(filePath, 'utf-8');
-        database.exec(sql);
+
+        // Execute each statement individually to handle "already exists" errors gracefully
+        const statements = sql.split(';').map(s => s.trim()).filter(s => s.length > 0 && !s.startsWith('--'));
+        for (const stmt of statements) {
+            try {
+                database.exec(stmt);
+            } catch (err) {
+                // Ignore "duplicate column" or "already exists" errors (idempotent migrations)
+                if (err.message.includes('duplicate column') || err.message.includes('already exists')) {
+                    // Column/table already exists, skip
+                } else {
+                    throw err;
+                }
+            }
+        }
         console.log(`Migration applied: ${file}`);
     }
 }
